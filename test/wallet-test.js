@@ -227,6 +227,10 @@ describe('Wallet', function() {
       await wdb.addTX(t4.toTX());
 
       const balance = await alice.getBalance();
+      // UCoins:
+      //  t4:0 - 11k
+      //  t4:1 - 11k
+      assert.strictEqual(balance.coin, 2);
       assert.strictEqual(balance.unconfirmed, 22000);
     }
 
@@ -234,28 +238,56 @@ describe('Wallet', function() {
       await wdb.addTX(t1.toTX());
 
       const balance = await alice.getBalance();
+      // UCoins:
+      //  t1:0 - 50k
+      //  t1:1 - 1k
+      //  t4:0 - 11k
+      //  t4:1 - 11k
+      assert.strictEqual(balance.coin, 4);
+      // 22000 + 51000 = 73000
       assert.strictEqual(balance.unconfirmed, 73000);
     }
 
     {
       await wdb.addTX(t2.toTX());
 
+      // t2 spends 50k from t1, but adds 48k from t2
+      // 2k less = 71000. BUT t2 output is consumed by t4 so:
+      // -24k. 71000 - 24000 = 47000
+      // UCoins:
+      //  t1:0 - 1k (t1:1 - 50k gone)
+      //  t2:0 - 24k (t2:1 is already consumed by t4)
+      //  t4:0 - 11k
+      //  t4:1 - 11k
       const balance = await alice.getBalance();
-      assert.strictEqual(balance.unconfirmed, 71000);
+      assert.strictEqual(balance.coin, 4);
+      assert.strictEqual(balance.unconfirmed, 47000);
     }
 
     {
       await wdb.addTX(t3.toTX());
 
+      // UCoins consumed:
+      //  t1:1 - 1k
+      //  t2:0 - 24k
+      //  t3:0 - 23k - already spent by t4
+      // UCoins:
+      //  t4:0 - 11k
+      //  t4:1 - 11k
       const balance = await alice.getBalance();
-      assert.strictEqual(balance.unconfirmed, 69000);
+      assert.strictEqual(balance.coin, 2);
+      assert.strictEqual(balance.unconfirmed, 22000);
     }
 
     {
       await wdb.addTX(f1.toTX());
+      // Coins consumed:
+      //  t4:1 - 11k
+      // Coins:
+      //  t4:0 - 11k
 
       const balance = await alice.getBalance();
-      assert.strictEqual(balance.unconfirmed, 58000);
+      assert.strictEqual(balance.unconfirmed, 11000);
 
       const txs = await alice.getHistory();
       assert(txs.some((wtx) => {
@@ -361,16 +393,16 @@ describe('Wallet', function() {
     await wdb.addTX(t1.toTX());
     assert.strictEqual((await wallet.getBalance()).unconfirmed, 50000);
 
-    let conflict = false;
+    let conflict = 0;
     wallet.on('conflict', () => {
-      conflict = true;
+      conflict += 1;
     });
 
     const t2 = new MTX();
     t2.addInput(input);
     t2.addOutput(new Address(), 5000);
     await wdb.addTX(t2.toTX());
-    assert(conflict);
+    assert.strictEqual(conflict, 1);
     assert.strictEqual((await wallet.getBalance()).unconfirmed, 0);
   });
 
@@ -389,9 +421,9 @@ describe('Wallet', function() {
     await wdb.addTX(txa.toTX());
     assert.strictEqual((await wallet.getBalance()).unconfirmed, 50000);
 
-    let conflict = false;
+    let conflict = 0;
     wallet.on('conflict', () => {
-      conflict = true;
+      conflict += 1;
     });
 
     const txb = new MTX();
@@ -400,8 +432,94 @@ describe('Wallet', function() {
     txb.addOutput(address, 49000);
     await wdb.addTX(txb.toTX());
 
-    assert(conflict);
+    assert.strictEqual(conflict, 1);
     assert.strictEqual((await wallet.getBalance()).unconfirmed, 49000);
+  });
+
+   it('should handle double-spend (with block)', async () => {
+    const wallet = await wdb.create();
+    const address = await wallet.receiveAddress();
+
+    const hash = random.randomBytes(32);
+    const input0 = Input.fromOutpoint(new Outpoint(hash, 0));
+    const input1 = Input.fromOutpoint(new Outpoint(hash, 1));
+
+    const txa = new MTX();
+    txa.addInput(input0);
+    txa.addInput(input1);
+    txa.addOutput(address, 50000);
+    await wdb.addTX(txa.toTX());
+    assert.strictEqual((await wallet.getBalance()).unconfirmed, 50000);
+
+    let conflict = 0;
+    wallet.on('conflict', () => {
+      conflict += 1;
+    });
+
+    const txb = new MTX();
+    txb.addInput(input0);
+    txb.addInput(input1);
+    txb.addOutput(address, 49000);
+
+    await wdb.addBlock(nextBlock(wdb), [txb.toTX()]);
+    assert.strictEqual(conflict, 1);
+    assert.strictEqual((await wallet.getBalance()).unconfirmed, 49000);
+    assert.strictEqual((await wallet.getBalance()).confirmed, 49000);
+  });
+
+  it('should recover from interrupt when removing conflict', async () => {
+    const wallet = await wdb.create();
+    const address = await wallet.receiveAddress();
+
+    const hash = random.randomBytes(32);
+    const input0 = Input.fromOutpoint(new Outpoint(hash, 0));
+    const input1 = Input.fromOutpoint(new Outpoint(hash, 1));
+
+    const txa = new MTX();
+    txa.addInput(input0);
+    txa.addInput(input1);
+    txa.addOutput(address, 50000);
+
+    await wdb.addTX(txa.toTX());
+    assert.strictEqual((await wallet.getBalance()).unconfirmed, 50000);
+    assert.strictEqual((await wallet.getBalance()).confirmed, 0);
+
+    let conflict = 0;
+    wallet.on('conflict', () => {
+      conflict += 1;
+    });
+
+    const txb = new MTX();
+    txb.addInput(input0);
+    txb.addInput(input1);
+    txb.addOutput(address, 49000);
+
+    const removeConflict = wallet.txdb.removeConflict;
+
+    wallet.txdb.removeConflict = async () => {
+      throw new Error('Unexpected interrupt.');
+    };
+
+    const entry = nextBlock(wdb);
+
+    await assert.rejects(async () => {
+      await wdb.addBlock(entry, [txb.toTX()]);
+    }, {
+      name: 'Error',
+      message: 'Unexpected interrupt.'
+    });
+
+    wallet.txdb.removeConflict = removeConflict;
+
+    assert.strictEqual(conflict, 0);
+    assert.strictEqual((await wallet.getBalance()).unconfirmed, 50000);
+    assert.strictEqual((await wallet.getBalance()).confirmed, 0);
+
+    await wdb.addBlock(entry, [txb.toTX()]);
+
+    assert.strictEqual(conflict, 1);
+    assert.strictEqual((await wallet.getBalance()).unconfirmed, 49000);
+    assert.strictEqual((await wallet.getBalance()).confirmed, 49000);
   });
 
   it('should handle more missed txs', async () => {
@@ -449,34 +567,67 @@ describe('Wallet', function() {
     await alice.sign(f1);
 
     {
+      // Coins:
+      //  t4:0 - 11k
+      //  t4:1 - 11k
       await wdb.addTX(t4.toTX());
       const balance = await alice.getBalance();
+      assert.strictEqual(balance.coin, 2);
       assert.strictEqual(balance.unconfirmed, 22000);
     }
 
     {
+      // Coins:
+      //  t1:0 - 50k
+      //  t1:1 - 1k
+      //  t4:0 - 11k
+      //  t4:1 - 11k
       await wdb.addTX(t1.toTX());
       const balance = await alice.getBalance();
+      assert.strictEqual(balance.coin, 4);
       assert.strictEqual(balance.unconfirmed, 73000);
     }
 
     {
+      // Coins consumed:
+      //  t1:0 - 50k
+      // Coins already spent:
+      //  t2:1 - 24k
+      // Coins:
+      //  t1:1 - 1k
+      //  t2:0 - 24k
+      //  t4:0 - 11k
+      //  t4:1 - 11k
       await wdb.addTX(t2.toTX());
       const balance = await alice.getBalance();
-      assert.strictEqual(balance.unconfirmed, 71000);
+      assert.strictEqual(balance.coin, 4);
+      assert.strictEqual(balance.unconfirmed, 47000);
     }
 
     {
+      // Coins consumed:
+      //  t1:1 - 1k
+      //  t2:0 - 24k
+      // Coins already spent:
+      //  t3:0 - 23k
+      // Coins:
+      //  t4:0 - 11k
+      //  t4:1 - 11k
       await wdb.addTX(t3.toTX());
       const balance = await alice.getBalance();
-      assert.strictEqual(balance.unconfirmed, 69000);
+      assert.strictEqual(balance.coin, 2);
+      assert.strictEqual(balance.unconfirmed, 22000);
     }
 
     {
       await wdb.addTX(f1.toTX());
 
+      // Coins consumed (alice)
+      //  t4:1 - 11k
+      // Coins:
+      //  t4:0 - 11k
       const balance = await alice.getBalance();
-      assert.strictEqual(balance.unconfirmed, 58000);
+      assert.strictEqual(balance.unconfirmed, 11000);
 
       const txs = await alice.getHistory();
       assert(txs.some((wtx) => {
@@ -2270,7 +2421,7 @@ describe('Wallet', function() {
       uTXCount++;
 
       // Check
-        const senderBal3 = await wallet.getBalance();
+      const senderBal3 = await wallet.getBalance();
       assert.strictEqual(senderBal3.tx, 7);
       // One less wallet coin because name UTXO belongs to recip now
       assert.strictEqual(senderBal3.coin, 3);
@@ -2750,6 +2901,46 @@ describe('Wallet', function() {
       assert.equal(txCount, 1);
       assert.equal(confirmedCount, 1);
     });
+
+    it('should emit conflict event (multiple inputs)', async () => {
+      const wallet = await wdb.create({id: 'test2'});
+      const address = await wallet.receiveAddress();
+
+      const wclient = new WalletClient({port: ports.wallet});
+      await wclient.open();
+
+      const cwallet = wclient.wallet(wallet.id, wallet.token);
+      await cwallet.open();
+
+      try {
+        const hash = random.randomBytes(32);
+        const input0 = Input.fromOutpoint(new Outpoint(hash, 0));
+        const input1 = Input.fromOutpoint(new Outpoint(hash, 1));
+
+        const txa = new MTX();
+        txa.addInput(input0);
+        txa.addInput(input1);
+        txa.addOutput(address, 50000);
+        await wdb.addTX(txa.toTX());
+        assert.strictEqual((await wallet.getBalance()).unconfirmed, 50000);
+
+        let conflict = 0;
+        cwallet.on('conflict', () => {
+          conflict += 1;
+        });
+
+        const txb = new MTX();
+        txb.addInput(input0);
+        txb.addInput(input1);
+        txb.addOutput(address, 49000);
+        await wdb.addTX(txb.toTX());
+
+        assert.strictEqual(conflict, 1);
+        assert.strictEqual((await wallet.getBalance()).unconfirmed, 49000);
+      } finally {
+        await wclient.close();
+      }
+    });
   });
 
   describe('Wallet Name Claims', function() {
@@ -3219,7 +3410,7 @@ describe('Wallet', function() {
       assert.strictEqual(bal.ulocked, value);
       assert.strictEqual(bal.clocked, value + secondHighest);
 
-      // Confirm REGISTER
+      // Confirm REDEEM
       const block = {
         height: wdb.height + 1,
         hash: Buffer.alloc(32),
